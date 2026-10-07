@@ -132,7 +132,6 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.name }}-build.${{ github.run_number }}
           name: "Ryzix 2048 v${{ steps.version.outputs.name }} (Build #${{ github.run_number }})"
-          body: |
 body: |
             ## Ryzix 2048 v${{ steps.version.outputs.name }} — Automated Release
 
