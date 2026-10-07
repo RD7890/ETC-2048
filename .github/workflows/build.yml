@@ -1,0 +1,158 @@
+name: Build ETC-2048 APK
+
+on:
+  push:
+    branches: [ "main", "release/**" ]
+    paths-ignore: [ '**.md', '.github/**' ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build ETC-2048 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. JDK 17 ─────────────────────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── 3. Gradle cache ───────────────────────────────────────────────────────
+      - name: Restore Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      # ── 4. Signing keystore ───────────────────────────────────────────────────
+      - name: Restore or generate signing keystore
+        run: |
+          mkdir -p signing
+          if [ -f signing/signing-key.jks ]; then
+            echo "Using committed keystore: $(wc -c < signing/signing-key.jks) bytes"
+          elif [ -n "${{ secrets.SIGNING_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.SIGNING_KEYSTORE_B64 }}" | base64 -d > signing/signing-key.jks
+            echo "Keystore from secret: $(wc -c < signing/signing-key.jks) bytes"
+          else
+            echo "::error::No permanent signing keystore found (missing signing/signing-key.jks and SIGNING_KEYSTORE_B64 secret). Refusing to generate a throwaway key — that would silently break updates for everyone on a previous install. Restore signing/signing-key.jks or set the SIGNING_KEYSTORE_B64 secret, then rerun."
+            exit 1
+          fi
+
+      # ── 5. local.properties ───────────────────────────────────────────────────
+      - name: Create local.properties
+        run: |
+          printf 'signing.storeFile=signing/signing-key.jks\nsigning.storePassword=etc2048pass\nsigning.keyAlias=etc2048\nsigning.keyPassword=etc2048pass\n' \
+            > local.properties
+
+      # ── 6. chmod gradlew ──────────────────────────────────────────────────────
+      - name: chmod gradlew
+        run: chmod +x ./gradlew
+
+      # ── 7. Auto version bump ──────────────────────────────────────────────────
+      - name: Bump version
+        run: |
+          BUILD=${{ github.run_number }}
+          VER_NAME="1.0.${BUILD}"
+          sed -i "s/versionCode = [0-9]*/versionCode = ${BUILD}/" app/build.gradle.kts
+          sed -i "s/versionName = \"[^\"]*\"/versionName = \"${VER_NAME}\"/" app/build.gradle.kts
+          echo "versionCode → ${BUILD}"
+          echo "versionName → ${VER_NAME}"
+
+      # ── 8. Build Release APK ──────────────────────────────────────────────────
+      - name: Assemble Release APK
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      # ── 9. Version info ───────────────────────────────────────────────────────
+      - name: Get version info
+        id: version
+        run: |
+          VER=$(grep 'versionName' app/build.gradle.kts | grep -oP '"[^"]+"' | tr -d '"' | head -1)
+          echo "name=$VER"                      >> $GITHUB_OUTPUT
+          echo "apk_name=Ryzix-v${VER}.apk"   >> $GITHUB_OUTPUT
+          echo "Version: $VER"
+
+      # ── 10. Rename APKs ───────────────────────────────────────────────────────
+      - name: Rename APKs
+        run: |
+          VER="${{ steps.version.outputs.name }}"
+          OUTDIR="app/build/outputs/apk/release"
+          # Gradle splits naming: app-<abi>-release.apk  +  app-universal-release.apk
+          declare -A ABI_LABELS=(
+            ["armeabi-v7a"]="armv7-watch-32bit"
+            ["arm64-v8a"]="arm64-phone-64bit"
+            ["x86_64"]="x86_64-emulator"
+            ["universal"]="universal-all-devices"
+          )
+          for ABI in "${!ABI_LABELS[@]}"; do
+            SRC="$OUTDIR/app-${ABI}-release.apk"
+            if [ -f "$SRC" ]; then
+              DEST="$OUTDIR/Ryzix-v${VER}-${ABI_LABELS[$ABI]}.apk"
+              cp "$SRC" "$DEST"
+              echo "Renamed: $SRC → $DEST"
+            fi
+          done
+          echo "All APKs in $OUTDIR:"
+          ls -lh "$OUTDIR"/Ryzix-*.apk
+
+      # ── 11. Upload artifacts ──────────────────────────────────────────────────
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        continue-on-error: true          # storage quota se build block na ho
+        with:
+          name: Ryzix-v${{ steps.version.outputs.name }}-all-apks
+          path: app/build/outputs/apk/release/Ryzix-*.apk
+          retention-days: 1
+
+      # ── 12. GitHub Release ────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.name }}-build.${{ github.run_number }}
+          name: "Ryzix 2048 v${{ steps.version.outputs.name }} (Build #${{ github.run_number }})"
+          body: |
+body: |
+            ## Ryzix 2048 v${{ steps.version.outputs.name }} — Automated Release
+
+            **Branch:** `${{ github.ref_name }}` | **Commit:** `${{ github.sha }}`
+            **Package:** `com.ryzix.game2048`
+
+            ### APK Downloads
+            | File | Description |
+            |------|-------------|
+            | `Ryzix-v${{ steps.version.outputs.name }}-universal-all-devices.apk` | Best for most devices |
+            | `Ryzix-v${{ steps.version.outputs.name }}-arm64-phone-64bit.apk` | Modern Android 64-bit |
+
+            ### Release Notes
+            - Fully compiled using the new custom **ETC Language**!
+            - 1:1 Replica of the original 2048 game
+            - Smooth animations, gestures, and sounds
+            - 100% Kotlin/Compose code generated by ETC
+
+          draft: false
+          prerelease: false
+          files: app/build/outputs/apk/release/Ryzix-*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
