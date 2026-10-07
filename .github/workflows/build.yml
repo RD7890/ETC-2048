@@ -2,8 +2,7 @@ name: Build ETC-2048 APK
 
 on:
   push:
-    branches: [ "main", "release/**" ]
-    paths-ignore: [ '**.md', '.github/**' ]
+    branches: [ "master", "release/**" ]
   workflow_dispatch: {}
 
 concurrency:
